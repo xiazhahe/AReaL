@@ -44,6 +44,7 @@ from transformers import (
     get_constant_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
+from transformers.core_model_loading import revert_weight_conversion
 
 from areal.api import (
     FinetuneSpec,
@@ -1410,6 +1411,24 @@ class FSDPEngine(TrainEngine):
         else:
             yield from name_params_iterator
 
+    def _to_checkpoint_layout(
+        self, name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Map one full parameter back to the HF checkpoint layout rollout engines load.
+
+        transformers 5 fuses some checkpoint tensors at load time (e.g. MoE experts
+        ``experts.{i}.gate_proj/up_proj/down_proj`` -> ``experts.gate_up_proj`` and
+        ``experts.down_proj``). SGLang/vLLM ``load_weights`` only map the checkpoint
+        names and silently skip the fused ones, so they are reverted here the same
+        way ``save_pretrained`` reverts them for the disk update path.
+        """
+        if self.config.use_lora or self.is_vision_model:
+            return [(name, tensor)]
+        reverted = revert_weight_conversion(self.model, {name: tensor})
+        if len(reverted) == 1 and name in reverted:
+            return [(name, tensor)]
+        return [(k, v.contiguous()) for k, v in reverted.items()]
+
     def _compute_dtype(self) -> torch.dtype:
         """Resolve config.dtype to torch.dtype (canonicalized in TrainEngineConfig)."""
         return getattr(torch, self.config.dtype)
@@ -1744,28 +1763,31 @@ class FSDPEngine(TrainEngine):
                 # Rollout engines (SGLang/vLLM) expect compute dtype (bf16).
                 tensor = self._cast_to_compute_dtype(tensor)
 
-                tensor_size = tensor.numel() * tensor.element_size()
-                bucket_overflow = (
-                    buffer_size > 0
-                    and tensor_size + buffer_size > weight_chunked_mem_size
-                )
-                if bucket_overflow:
-                    # Only middle buckets need drain+align before the next all-gather.
-                    if pending_bucket is not None:
-                        self._wait_pending_weight_update_bucket(pending_bucket)
-                        pending_bucket = None
-
-                    pending_bucket = self._update_bucket_weights_from_distributed_async(
-                        meta,
-                        named_tensors,
-                        stream=broadcast_stream,
+                for name, tensor in self._to_checkpoint_layout(name, tensor):
+                    tensor_size = tensor.numel() * tensor.element_size()
+                    bucket_overflow = (
+                        buffer_size > 0
+                        and tensor_size + buffer_size > weight_chunked_mem_size
                     )
+                    if bucket_overflow:
+                        # Only middle buckets need drain+align before the next all-gather.
+                        if pending_bucket is not None:
+                            self._wait_pending_weight_update_bucket(pending_bucket)
+                            pending_bucket = None
 
-                    named_tensors = []
-                    buffer_size = 0
+                        pending_bucket = (
+                            self._update_bucket_weights_from_distributed_async(
+                                meta,
+                                named_tensors,
+                                stream=broadcast_stream,
+                            )
+                        )
 
-                buffer_size += tensor_size
-                named_tensors.append((name, tensor))
+                        named_tensors = []
+                        buffer_size = 0
+
+                    buffer_size += tensor_size
+                    named_tensors.append((name, tensor))
 
             if pending_bucket:
                 self._wait_pending_weight_update_bucket(pending_bucket)
