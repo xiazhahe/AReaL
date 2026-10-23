@@ -9,7 +9,10 @@ from vllm.logger import init_logger
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+)
 
 try:
     from vllm.config import set_current_vllm_config
@@ -39,14 +42,13 @@ class VLLMWorkerExtension:
     def areal_update_weights(self, model_path):
         logger.info(f"start update weights, {model_path}", flush=True)
         try:
-            # load weight
-            self.model_runner.model_config.model = model_path
-            model_loader = get_model_loader(self.model_runner.vllm_config.load_config)
-            logger.info("Reloading weights inplace...")
-            with set_current_vllm_config(self.model_runner.vllm_config):
-                model_loader.load_weights(
-                    self.model_runner.model, model_config=self.model_runner.model_config
-                )
+            # reload_weights re-runs process_weights_after_loading (e.g. the aiter MoE
+            # shuffle) and copies the result into the original storage.
+            with (
+                torch.device(self.model_runner.device),
+                set_current_vllm_config(self.model_runner.vllm_config),
+            ):
+                self.model_runner.reload_weights(weights_path=model_path)
             self.sync()
 
             return True, "Success"
@@ -142,25 +144,57 @@ class VLLMWorkerExtension:
                 f"Weight update group named `{self.areal_weight_meta_group_name}` not found"
             )
         try:
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                tensor = torch.empty(
-                    shape, dtype=target_dtype, device=self.model_runner.device
-                )
-                torch.distributed.broadcast(
-                    tensor,
-                    src=0,
-                    group=group,
-                    async_op=False,
-                )
-                with set_current_vllm_config(self.model_runner.vllm_config):
+            with (
+                torch.device(self.model_runner.device),
+                set_current_vllm_config(self.model_runner.vllm_config),
+            ):
+                self._areal_begin_weight_update()
+                for name, dtype, shape in zip(names, dtypes, shapes):
+                    target_dtype = (
+                        dtype
+                        if isinstance(dtype, torch.dtype)
+                        else getattr(torch, dtype)
+                    )
+                    tensor = torch.empty(
+                        shape, dtype=target_dtype, device=self.model_runner.device
+                    )
+                    torch.distributed.broadcast(
+                        tensor,
+                        src=0,
+                        group=group,
+                        async_op=False,
+                    )
                     self.model_runner.model.load_weights(weights=[(name, tensor)])
             self.sync()
             return True, "Success"
         except Exception as e:
             error_msg = f"Failed to update parameter! {e}."
+            logger.error(error_msg)
+            return False, error_msg
+
+    def _areal_begin_weight_update(self):
+        # One layerwise session spans every bucket of a refit: a layer is re-processed
+        # only once all of its tensors have arrived, so its weights never mix layouts.
+        if not getattr(self, "_areal_weight_update_active", False):
+            initialize_layerwise_reload(self.model_runner.model)
+            self._areal_weight_update_active = True
+
+    def areal_finalize_weight_update(self):
+        if not getattr(self, "_areal_weight_update_active", False):
+            return True, "No weight update in progress"
+        try:
+            with (
+                torch.device(self.model_runner.device),
+                set_current_vllm_config(self.model_runner.vllm_config),
+            ):
+                finalize_layerwise_reload(
+                    self.model_runner.model, self.model_runner.model_config
+                )
+            self._areal_weight_update_active = False
+            self.sync()
+            return True, "Success"
+        except Exception as e:
+            error_msg = f"Failed to finalize weight update! {e}."
             logger.error(error_msg)
             return False, error_msg
 
