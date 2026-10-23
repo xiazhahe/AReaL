@@ -2723,7 +2723,21 @@ class SGLangConfig:
         node_rank: int = 0,
         pp_size: int = 1,
     ):
+        import torch
+
         attention_backend = sglang_config.attention_backend
+        if attention_backend == "fa3" and torch.version.hip is not None:
+            # sgl_kernel ships no FA3 kernels on ROCm. aiter is SGLang's own ROCm
+            # default, but deterministic inference only accepts flashinfer, fa3 and
+            # triton, so use triton there.
+            rocm_backend = (
+                "triton" if sglang_config.enable_deterministic_inference else "aiter"
+            )
+            logger.info(
+                "attention_backend='fa3' is unavailable on ROCm; using %r instead.",
+                rocm_backend,
+            )
+            attention_backend = rocm_backend
         if (
             sglang_config.enable_deterministic_inference
             and attention_backend is not None
@@ -2738,6 +2752,7 @@ class SGLangConfig:
             )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        args["attention_backend"] = attention_backend
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,
